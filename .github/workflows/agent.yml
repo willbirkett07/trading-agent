@@ -1,0 +1,48 @@
+name: Trading agent
+
+on:
+  schedule:
+    # Hourly on weekdays, 14:05-21:05 UTC. The agent skips itself when the US market is closed.
+    - cron: "5 14-21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trading-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install anthropic requests
+
+      - name: Run one cycle (paper trading only)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+        run: python trading_agent.py --broker alpaca --once
+
+      - name: Save logs so the dashboard can show them
+        if: always()
+        run: |
+          mkdir -p agent_state docs/data
+          if [ -f agent_state/decisions.jsonl ]; then cp agent_state/decisions.jsonl docs/data/decisions.jsonl; fi
+          git config user.name "trading-agent"
+          git config user.email "trading-agent@users.noreply.github.com"
+          git add agent_state docs/data
+          if ! git diff --staged --quiet; then
+            git commit -m "agent run"
+            git pull --rebase
+            git push
+          fi
