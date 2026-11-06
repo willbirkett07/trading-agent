@@ -159,5 +159,22 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(broker.cash, 10_000.0)
 
 
+class FillsBroker(SimBroker):
+    def fills(self, after=None):
+        return [{"id": "1", "ts": "2026-11-06T15:00:00Z", "symbol": "AAA",
+                 "side": "buy", "qty": 2.0, "price": 100.0}]
+
+
+class FillsLogging(unittest.TestCase):
+    def test_fills_are_logged_and_remembered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            run_once(cfg, FillsBroker(cfg.watchlist, seed=1), FakeDecider({"orders": []}))
+            kinds = [json.loads(l)["kind"] for l in (Path(tmp) / "decisions.jsonl").read_text().splitlines()]
+            self.assertIn("fills", kinds)
+            self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["last_fill_ts"],
+                             "2026-11-06T15:00:00Z")
+
+
 if __name__ == "__main__":
     unittest.main()
