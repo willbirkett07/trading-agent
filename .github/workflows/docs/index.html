@@ -1,7 +1,178 @@
-Claude Trading Agent
-Paper trading only: simulated money, real prices. It runs hourly while the US market is open.
-Account value
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Trading Agent</title>
+<style>
+:root{--bg:#fafaf8;--card:#fff;--text:#1c1c1a;--muted:#6b6b66;--line:#e4e3de;--up:#1a7f4b;--down:#c0392b;--a:#3b5bdb;--b:#9a9a93;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#1f1f1d;--text:#ecece8;--muted:#9a9a93;--line:#333330;--up:#4cc38a;--down:#ff6b5e;--a:#8aa2ff;--b:#8a8a84;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:960px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.4rem;margin:0 0 4px}
+h2{font-size:1.05rem;margin:28px 0 8px}
+.banner{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--a);padding:10px 14px;border-radius:8px;margin:12px 0 20px;font-size:.9rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card small{color:var(--muted);display:block;font-size:.8rem}
+.card b{font-size:1.2rem}
+.up{color:var(--up)}.down{color:var(--down)}.muted{color:var(--muted)}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:500;white-space:nowrap}
+svg{width:100%;height:auto;display:block}
+.legend{display:flex;gap:16px;font-size:.85rem;margin-top:6px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+.bar{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:.88rem}
+.bar span:first-child{width:56px}
+.bar i{display:block;height:14px;border-radius:3px}
+button{font:inherit;background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 12px;margin-top:10px;cursor:pointer}
+</style>
+</head>
+<body>
+<main>
+  <h1>Claude Trading Agent</h1>
+  <div class="banner">Paper trading only: simulated money, real prices. Updated hourly while the US market is open. Add <code>?demo</code> to the web address to preview with sample data.</div>
+  <div id="app"><p class="muted">Loading…</p></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const money = n => (n < 0 ? '-' : '') + '$' + Math.abs(n).toLocaleString('en-US', {maximumFractionDigits: 2});
+const pct = (n, d = 2) => (n >= 0 ? '+' : '') + (n * 100).toFixed(d) + '%';
+const cls = n => n >= 0 ? 'up' : 'down';
+const when = t => new Date(t).toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'});
+const card = (label, value, c) => `<div class="card"><small>${label}</small><b class="${c || ''}">${value}</b></div>`;
 
-Claude’s latest view
+const params = new URLSearchParams(location.search);
+fetch('data/decisions.jsonl?' + Date.now()).then(r => r.ok ? r.text() : '').catch(() => '').then(txt => {
+  let ev = txt.split('\n').map(l => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+  if (params.has('demo')) ev = demo();
+  render(ev);
+});
 
-Recent trades
+// Turn the log into trades, then pair buys with sells (first in, first out) to get closed-trade results.
+function tradesFrom(ev, cyc) {
+  let fills = ev.filter(e => e.kind === 'fills').flatMap(e => e.fills || []);
+  if (!fills.length) {  // fallback: the agent's own submitted orders
+    fills = cyc.flatMap(c => (c.results || []).filter(r => r.status === 'submitted')
+      .map(r => ({id: c.ts + r.symbol, ts: c.ts, symbol: r.symbol, side: r.side, qty: r.qty, price: r.price})));
+  }
+  fills.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  const reasons = cyc.flatMap(c => (c.results || []).map(r => ({ts: c.ts, symbol: r.symbol, side: r.side, reason: r.reason})));
+  const lots = {}, closed = [];
+  fills.forEach(f => {
+    f.reason = (reasons.filter(r => r.symbol === f.symbol && r.side === f.side && new Date(r.ts) <= new Date(f.ts)).pop() || {}).reason || '';
+    const L = lots[f.symbol] = lots[f.symbol] || [];
+    if (f.side === 'buy') { L.push({q: f.qty, p: f.price}); return; }
+    let rem = f.qty, pnl = 0, cost = 0;
+    while (rem > 0 && L.length) {
+      const take = Math.min(rem, L[0].q);
+      pnl += (f.price - L[0].p) * take; cost += L[0].p * take; L[0].q -= take; rem -= take;
+      if (L[0].q <= 0) L.shift();
+    }
+    if (cost > 0) closed.push({ts: f.ts, symbol: f.symbol, pnl, ret: pnl / cost});
+  });
+  return {fills, closed};
+}
+
+function lineChart(series, n) {
+  const all = series.flatMap(s => s.pts.map(p => p[1])).concat(0);
+  const lo = Math.min(...all), hi = Math.max(...all), span = (hi - lo) || 1;
+  const x = i => 56 + i / (n - 1) * 570, y = v => 20 + (hi - v) / span * 160;
+  const lines = series.map(s => `<polyline points="${s.pts.map(p => x(p[0]).toFixed(1) + ',' + y(p[1]).toFixed(1)).join(' ')}" fill="none" stroke="${s.color}" stroke-width="2.5" stroke-linejoin="round"/>`).join('');
+  return `<svg viewBox="0 0 640 200" role="img" aria-label="Return over time">` +
+    `<line x1="56" x2="626" y1="${y(0)}" y2="${y(0)}" stroke="var(--line)" stroke-dasharray="4 4"/>` +
+    `<text x="4" y="${y(hi) + 4}" fill="var(--muted)" font-size="11">${pct(hi, 1)}</text>` +
+    `<text x="4" y="${y(lo) + 4}" fill="var(--muted)" font-size="11">${pct(lo, 1)}</text>${lines}</svg>` +
+    `<div class="legend">${series.map(s => `<span><i class="dot" style="background:${s.color}"></i>${s.name}</span>`).join('')}</div>`;
+}
+
+function render(ev) {
+  const cyc = ev.filter(e => e.kind === 'cycle' && e.account);
+  if (!cyc.length) {
+    $('app').innerHTML = '<div class="card muted">No runs yet. The first one happens when the US market is open (weekdays, roughly 2:30pm to 9pm UK time).</div>';
+    return;
+  }
+  const last = ev[ev.length - 1], lc = cyc[cyc.length - 1];
+  const eq = cyc.map(c => c.account.equity), e0 = eq[0], e1 = eq[eq.length - 1], ret = e1 / e0 - 1;
+  let peak = e0, mdd = 0;
+  eq.forEach(v => { peak = Math.max(peak, v); mdd = Math.min(mdd, v / peak - 1); });
+  const bm = cyc.map(c => c.benchmark || null), b0 = bm.find(v => v), b1 = [...bm].reverse().find(v => v);
+  const spy = b0 && b1 ? b1 / b0 - 1 : null;
+  const {fills, closed} = tradesFrom(ev, cyc);
+  const wins = closed.filter(t => t.pnl > 0), losses = closed.filter(t => t.pnl <= 0);
+  const avg = a => a.length ? a.reduce((s, t) => s + t.pnl, 0) / a.length : null;
+  const bySym = {};
+  closed.forEach(t => bySym[t.symbol] = (bySym[t.symbol] || 0) + t.pnl);
+  const maxAbs = Math.max(1, ...Object.values(bySym).map(Math.abs));
+
+  const status = last.kind === 'halt' ? 'Halted: ' + esc(last.reason) : 'Running';
+  const kpis =
+    card('Account value', money(e1)) +
+    card('Total return', pct(ret), cls(ret)) +
+    card('vs SPY (market)', spy == null ? '–' : pct(ret - spy), spy == null ? '' : cls(ret - spy)) +
+    card('Max drawdown', pct(mdd), mdd < -0.05 ? 'down' : '') +
+    card('Trades (fills)', fills.length) +
+    card('Win rate', closed.length ? (wins.length / closed.length * 100).toFixed(0) + '% (' + closed.length + ' closed)' : '–') +
+    card('Average win', avg(wins) == null ? '–' : money(avg(wins)), 'up') +
+    card('Average loss', avg(losses) == null ? '–' : money(avg(losses)), 'down') +
+    card('Status', status) + card('Last run', when(lc.ts));
+
+  const series = [{name: 'Agent', color: 'var(--a)', pts: eq.map((v, i) => [i, v / e0 - 1])}];
+  if (b0) series.push({name: 'SPY (S&P 500 ETF)', color: 'var(--b)', pts: bm.map((v, i) => v ? [i, v / b0 - 1] : null).filter(Boolean)});
+  const chart = cyc.length < 2 ? '<span class="muted">The chart appears after two runs.</span>' : lineChart(series, cyc.length);
+
+  const pos = lc.positions || [];
+  const posRows = pos.length ? '<table><tr><th>Stock</th><th>Shares</th><th>Avg entry</th><th>Price</th><th>Profit/loss</th></tr>' +
+    pos.map(p => `<tr><td>${esc(p.symbol)}</td><td>${esc(p.qty)}</td><td>${money(p.avg_entry)}</td><td>${money(p.price)}</td>` +
+      `<td class="${cls(p.unrealized_pl)}">${money(p.unrealized_pl)} (${pct(p.price / p.avg_entry - 1)})</td></tr>`).join('') + '</table>'
+    : '<span class="muted">No open positions (the agent is in cash).</span>';
+
+  const bars = Object.keys(bySym).length ? Object.entries(bySym).sort((a, b) => b[1] - a[1]).map(([s, v]) =>
+    `<div class="bar"><span>${esc(s)}</span><i style="width:${Math.max(2, Math.abs(v) / maxAbs * 60)}%;background:var(--${v >= 0 ? 'up' : 'down'})"></i><span class="${cls(v)}">${money(v)}</span></div>`).join('')
+    : '<span class="muted">No closed trades yet.</span>';
+
+  const rows = fills.slice().reverse();
+  const tradeTable = n => rows.length ? '<table><tr><th>When</th><th>Trade</th><th>Price</th><th>Value</th><th>Why</th></tr>' +
+    rows.slice(0, n).map(t => `<tr><td>${when(t.ts)}</td><td class="${t.side === 'buy' ? 'up' : 'down'}">${esc(t.side).toUpperCase()} ${esc(t.qty)} ${esc(t.symbol)}</td>` +
+      `<td>${money(t.price)}</td><td>${money(t.price * t.qty)}</td><td>${esc(t.reason) || '<span class="muted">stop/target or earlier run</span>'}</td></tr>`).join('') + '</table>'
+    : '<span class="muted">No trades yet. Staying in cash is a valid decision for the agent.</span>';
+
+  const decisions = '<table><tr><th>When</th><th>Claude’s view</th><th>Orders</th></tr>' +
+    cyc.slice(-8).reverse().map(c => `<tr><td>${when(c.ts)}</td><td>${esc(c.market_view) || '–'}` +
+      `${(c.rejected || []).map(r => `<div class="muted">Blocked: ${esc(r)}</div>`).join('')}</td><td>${(c.results || []).length}</td></tr>`).join('') + '</table>';
+
+  $('app').innerHTML =
+    `<div class="stats">${kpis}</div>` +
+    `<h2>Return over time</h2><div class="card">${chart}</div>` +
+    `<h2>Open positions</h2><div class="card scroll">${posRows}</div>` +
+    `<h2>Profit/loss by stock (closed trades)</h2><div class="card">${bars}</div>` +
+    `<h2>Trade history</h2><div class="card scroll" id="tt">${tradeTable(20)}</div>` +
+    (rows.length > 20 ? '<button id="more">Show all ' + rows.length + ' trades</button>' : '') +
+    `<h2>Recent decisions</h2><div class="card scroll">${decisions}</div>`;
+  if ($('more')) $('more').onclick = () => { $('tt').innerHTML = tradeTable(rows.length); $('more').remove(); };
+}
+
+function demo() {  // sample data so you can preview the layout; never written anywhere
+  let s = 7; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  const ev = [], t0 = Date.UTC(2026, 10, 9, 15), syms = ['NVDA', 'MU', 'LLY', 'AVGO'];
+  let eq = 100000, spy = 600, held = {};
+  for (let i = 0; i < 40; i++) {
+    const ts = new Date(t0 + i * 3600e3 * (i % 7 + 1)).toISOString();
+    eq *= 1 + (rnd() - 0.46) * 0.01; spy *= 1 + (rnd() - 0.47) * 0.006;
+    const res = [], fl = [];
+    if (i % 5 === 1) { const sy = syms[i % 4], px = 100 + rnd() * 400; held[sy] = {qty: 5, p: px}; res.push({side: 'buy', qty: 5, symbol: sy, price: px, status: 'submitted', reason: 'Strong 20-day momentum'}); fl.push({id: 'b' + i, ts, symbol: sy, side: 'buy', qty: 5, price: px}); }
+    if (i % 5 === 4) { const sy = Object.keys(held)[0]; if (sy) { const px = held[sy].p * (1 + (rnd() - 0.42) * 0.15); fl.push({id: 's' + i, ts, symbol: sy, side: 'sell', qty: 5, price: px}); delete held[sy]; } }
+    ev.push({kind: 'cycle', ts, account: {equity: eq, cash: eq * 0.6}, benchmark: spy, market_view: 'Sample data: tech is choppy; staying selective.',
+      rejected: i % 9 === 3 ? ['buy ZZZ: not on watchlist'] : [], results: res,
+      positions: Object.entries(held).map(([symbol, h]) => ({symbol, qty: 5, avg_entry: h.p, price: h.p * 1.03, unrealized_pl: h.p * 0.15}))});
+    if (fl.length) ev.push({kind: 'fills', ts, fills: fl});
+  }
+  return ev;
+}
+</script>
+</body>
+</html>
