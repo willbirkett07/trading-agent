@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trading_agent import (Config, SimBroker, check_halts, parse_decision,
-                           run_once, vet_orders)
+from trading_agent import (Config, Finnhub, SimBroker, check_halts, open_theses,
+                           parse_decision, pattern_stats, recent_decisions, rsi,
+                           run_once, track_record, vet_orders)
 
 
 def make_cfg(tmp):
@@ -174,6 +175,172 @@ class FillsLogging(unittest.TestCase):
             self.assertIn("fills", kinds)
             self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["last_fill_ts"],
                              "2026-11-06T15:00:00Z")
+
+
+def series(values):
+    return [(f"2026-01-{i + 1:02d}" if i < 31 else f"2026-02-{i - 30:02d}", v) for i, v in enumerate(values)]
+
+
+class Patterns(unittest.TestCase):
+    def test_uptrend_stats(self):
+        s = [(f"d{i:04d}", 100 + i) for i in range(300)]
+        st = pattern_stats(s)
+        self.assertTrue(st["above_200d_avg"])
+        self.assertGreater(st["ret_12m_pct"], 0)
+        self.assertEqual(st["rsi14"], 100.0)
+        self.assertEqual(st["max_drawdown_1y_pct"], 0.0)
+
+    def test_short_history_leaves_out_long_stats(self):
+        st = pattern_stats([(f"d{i:03d}", 100 + i) for i in range(30)])
+        self.assertNotIn("above_200d_avg", st)
+        self.assertNotIn("ret_12m_pct", st)
+        self.assertIn("ret_1m_pct", st)
+
+    def test_too_little_data_returns_nothing(self):
+        self.assertEqual(pattern_stats([("d1", 1.0), ("d2", 2.0)]), {})
+
+    def test_behaviour_on_market_down_days(self):
+        dates = [f"d{i:03d}" for i in range(60)]
+        spy_vals, my_vals = [100.0], [100.0]
+        for i in range(1, 60):
+            move = -0.02 if i % 10 == 0 else 0.002
+            spy_vals.append(spy_vals[-1] * (1 + move))
+            my_vals.append(my_vals[-1] * (1 + 2 * move))   # falls twice as hard
+        st = pattern_stats(list(zip(dates, my_vals)), list(zip(dates, spy_vals)))
+        down = st["on_days_spy_fell_1pct"]
+        self.assertEqual(down["days"], 5)
+        self.assertLess(down["avg_this_pct"], down["avg_spy_pct"])
+        self.assertGreater(st["correlation_with_spy"], 0.9)
+
+    def test_rsi_all_down_is_zero(self):
+        self.assertEqual(rsi([float(x) for x in range(30, 0, -1)]), 0.0)
+
+
+class Memory(unittest.TestCase):
+    EVENTS = [
+        {"kind": "cycle", "ts": "2026-11-09T15:00:00+00:00", "account": {"equity": 10000.0}, "benchmark": 600.0,
+         "market_view": "calm", "rejected": [],
+         "results": [{"side": "buy", "qty": 10, "symbol": "AAA", "price": 100.0, "status": "submitted",
+                      "reason": "momentum", "stop_price": 92.0, "take_profit": 120.0}]},
+        {"kind": "fills", "ts": "x", "fills": [
+            {"id": "1", "ts": "2026-11-09T15:01:00Z", "symbol": "AAA", "side": "buy", "qty": 10, "price": 100.0},
+            {"id": "2", "ts": "2026-11-10T15:01:00Z", "symbol": "AAA", "side": "sell", "qty": 10, "price": 110.0}]},
+        {"kind": "cycle", "ts": "2026-11-10T16:00:00+00:00", "account": {"equity": 10100.0}, "benchmark": 612.0,
+         "market_view": "up", "rejected": ["x"], "results": []},
+    ]
+
+    def test_track_record_pairs_buys_and_sells(self):
+        rec = track_record(self.EVENTS)
+        self.assertEqual(rec["closed_trades"], 1)
+        self.assertEqual(rec["win_rate_pct"], 100)
+        self.assertEqual(rec["pnl_by_symbol_usd"], {"AAA": 100.0})
+        self.assertEqual(rec["agent_return_pct"], 1.0)
+        self.assertEqual(rec["spy_return_pct_same_period"], 2.0)
+
+    def test_track_record_empty_log(self):
+        self.assertEqual(track_record([]), {"closed_trades": 0})
+
+    def test_open_position_thesis(self):
+        th = open_theses(self.EVENTS, [{"symbol": "AAA"}, {"symbol": "BBB"}])
+        self.assertEqual(th["AAA"]["why"], "momentum")
+        self.assertEqual(th["AAA"]["stop_price"], 92.0)
+        self.assertNotIn("BBB", th)
+
+    def test_recent_decisions_summary(self):
+        recent = recent_decisions(self.EVENTS)
+        self.assertEqual(len(recent), 2)
+        self.assertEqual(recent[1]["blocked"], 1)
+        self.assertIn("momentum", recent[0]["orders"][0])
+
+
+class CapturingDecider:
+    def __init__(self, payload=None):
+        self.snapshot, self.payload = None, payload or {"orders": []}
+
+    def decide(self, snapshot):
+        self.snapshot = snapshot
+        return json.dumps(self.payload)
+
+
+class FakeFundamentals:
+    def get(self, symbols):
+        return {"AAA": {"pe_ttm": 25.0, "next_earnings": "2026-11-20"}}
+
+
+class ExtraContext(unittest.TestCase):
+    def test_snapshot_contains_patterns_fundamentals_and_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            dec = CapturingDecider()
+            run_once(cfg, SimBroker(cfg.watchlist, seed=3), dec, fundamentals=FakeFundamentals())
+            self.assertIn("AAA", dec.snapshot["patterns_1y"])
+            self.assertEqual(dec.snapshot["fundamentals"]["AAA"]["pe_ttm"], 25.0)
+            self.assertEqual(set(dec.snapshot["memory"]),
+                             {"track_record", "open_position_theses", "recent_decisions", "your_notes_to_self"})
+
+    def test_notes_are_saved_capped_and_fed_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            broker = SimBroker(cfg.watchlist, seed=3)
+            for i in range(17):
+                run_once(cfg, broker, CapturingDecider({"orders": [], "notes_to_future_self": f"note {i}"}))
+            dec = CapturingDecider()
+            run_once(cfg, broker, dec)
+            notes = dec.snapshot["memory"]["your_notes_to_self"]
+            self.assertEqual(len(notes), 15)
+            self.assertEqual(notes[-1], "note 16")
+            self.assertEqual(len(dec.snapshot["memory"]["recent_decisions"]), 5)
+
+    def test_broken_extras_never_stop_trading(self):
+        class Broken(SimBroker):
+            def history(self, symbols, days=400):
+                raise RuntimeError("history down")
+
+        class BrokenFundamentals:
+            def get(self, symbols):
+                raise RuntimeError("fundamentals down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            broker = Broken(cfg.watchlist, seed=3)
+            dec = FakeDecider({"market_view": "ok", "orders": [buy(notional=500)]})
+            results = run_once(cfg, broker, dec, fundamentals=BrokenFundamentals())
+            self.assertEqual(results[0]["status"], "submitted")
+            log = (Path(tmp) / "decisions.jsonl").read_text()
+            self.assertIn("patterns_1y", log)
+            self.assertIn("fundamentals", log)
+
+
+class FinnhubFake(Finnhub):
+    calls = 0
+
+    def _get(self, path, **params):
+        FinnhubFake.calls += 1
+        if path == "/stock/metric":
+            return {"metric": {"peTTM": 30.126, "revenueGrowthTTMYoy": 55.5, "junk": "x"}}
+        return {"earningsCalendar": [{"date": "2026-11-20"}]}
+
+
+class FundamentalsProvider(unittest.TestCase):
+    def test_parses_and_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            FinnhubFake.calls = 0
+            fh = FinnhubFake("token", cfg)
+            first = fh.get(["NVDA"])
+            self.assertEqual(first["NVDA"]["pe_ttm"], 30.13)
+            self.assertEqual(first["NVDA"]["revenue_growth_yoy_pct"], 55.5)
+            self.assertEqual(first["NVDA"]["next_earnings"], "2026-11-20")
+            self.assertEqual(FinnhubFake.calls, 2)
+            fh.get(["NVDA"])
+            self.assertEqual(FinnhubFake.calls, 2)   # second call served from the cache
+
+    def test_failure_skips_symbol(self):
+        class Down(Finnhub):
+            def _get(self, path, **params):
+                raise RuntimeError("down")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(Down("t", make_cfg(tmp)).get(["NVDA"]), {})
 
 
 if __name__ == "__main__":
