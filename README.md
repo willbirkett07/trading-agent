@@ -1,4 +1,4 @@
-# Claude trading agent (cloud version)
+trading agent 
 
 Runs once an hour while the US market is open, on GitHub's servers, with **paper (fake) money only**. A dashboard site shows what it did. Do the setup on a computer; it's a one-time job.
 
