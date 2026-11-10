@@ -2,7 +2,7 @@ name: Trading agent
 
 on:
   schedule:
-    # Hourly on weekdays, 14:05-21:05 UTC. The agent skips itself when the US market is closed.
+    #hourly on weekdays, 14:30-21:30 UTC. The agent skips itself when the US market is closed.
     - cron: "5 14-21 * * 1-5"
   workflow_dispatch:
 
