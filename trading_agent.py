@@ -29,7 +29,7 @@ import requests
 @dataclass
 class Config:
     watchlist: list = field(default_factory=lambda: [
-        "SPY", "QQQ", "SOXX", "NVDA", "AVGO", "TSM", "MU", "WDC", "LLY", "XOM",
+        "SPY", "QQQ", "SOXX", "NVDA", "AVGO", "TSM", "MU", "WDC", "LLY", "XOM", "LTM"
     ])
     goal: str = "High risk, high return growth. Holding period of days to weeks. Long only."
     max_position_pct: float = 0.10     # max 10% of equity in any one stock
